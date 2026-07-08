@@ -14,8 +14,6 @@ Expected input CSV columns: Dam ID, Dam name, Latitude, Longitude, Area_km2
 import os
 from pathlib import Path
 
-import math
-
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
@@ -31,6 +29,12 @@ HYDRORIVERS_DIR = Path(
 DEFAULT_SNAP_RADIUS = 1000   # metres -- distances beyond this get flagged for review
 HARD_SNAP_CUTOFF = 2000      # metres -- hard cutoff, no snap beyond this
 SAVE_EVERY = 10
+
+# Metric CRS used purely for distance measurement (search radius, snap
+# distance). HydroRIVERS ships in geographic WGS84 (EPSG:4326); degrees are
+# not a reliable distance unit. Output geometry stays in the original CRS.
+# Matches the approach used in ExtractDownstreamRiverCourse.py.
+METRIC_CRS = "EPSG:4087"  # World Equidistant Cylindrical
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "Data"
@@ -77,71 +81,83 @@ def find_hydrorivers_shp() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Build the upstream connectivity graph once (geometry-free, fast)
+# Load the full river network ONCE (geometry + attributes) and build both
+# the reverse connectivity graph and a metric-CRS copy for snapping.
+#
+# Loading everything once and filtering in-memory (via .isin()) — rather
+# than re-querying the shapefile per dam with a GDAL "where" clause — avoids
+# pushing large HYRIV_ID IN (...) lists down to GDAL's shapefile SQL engine,
+# which has practical limits on expression length/complexity and fails with
+# an "Invalid SQL query for layer ..." error once the upstream ID list gets
+# large (e.g. a dam far downstream on a major river with many contributing
+# tributaries). This mirrors the working pattern already used in
+# ExtractBasinAtlasAttributesAtDamSite.py (basins[basins["HYBAS_ID"].isin(...)]).
 # ---------------------------------------------------------------------------
 
-def build_reverse_graph(shp_path: Path) -> dict:
-    """Read only HYRIV_ID / NEXT_DOWN and build a reverse adjacency dict:
-    {HYRIV_ID: [list of HYRIV_IDs whose NEXT_DOWN == HYRIV_ID]}."""
+def load_river_network(shp_path: Path):
+    """Read the full HydroRIVERS layer once. Returns (rivers, rivers_metric,
+    reverse_graph)."""
     old_cwd = os.getcwd()
     try:
         os.chdir(shp_path.parent)  # GDAL/Fiona macOS path-stripping workaround
-        df = gpd.read_file(
-            shp_path.name,
-            columns=["HYRIV_ID", "NEXT_DOWN"],
-            ignore_geometry=True,
-        )
+        rivers = gpd.read_file(shp_path.name)
     finally:
         os.chdir(old_cwd)
 
+    required_cols = ["HYRIV_ID", "NEXT_DOWN"]
+    missing = [c for c in required_cols if c not in rivers.columns]
+    if missing:
+        raise ValueError(f"River network is missing expected columns: {missing}")
+
+    if rivers.crs is None:
+        raise ValueError("River network has no CRS defined.")
+
+    rivers_metric = rivers.to_crs(METRIC_CRS)
+
     reverse_graph: dict = {}
-    for hyriv_id, next_down in zip(df["HYRIV_ID"].to_numpy(), df["NEXT_DOWN"].to_numpy()):
+    for hyriv_id, next_down in zip(
+        rivers["HYRIV_ID"].to_numpy(), rivers["NEXT_DOWN"].to_numpy()
+    ):
         if next_down == 0:
             continue
         reverse_graph.setdefault(next_down, []).append(hyriv_id)
-    return reverse_graph
+
+    return rivers, rivers_metric, reverse_graph
 
 
 # ---------------------------------------------------------------------------
 # Snapping: find the nearest river reach to a dam point
 # ---------------------------------------------------------------------------
 
-METERS_PER_DEGREE = 111_320  # at the equator; scaled by cos(lat) below for longitude
+def snap_to_nearest_reach(rivers: gpd.GeoDataFrame, rivers_metric: gpd.GeoDataFrame,
+                           lon: float, lat: float, radius_m: float = HARD_SNAP_CUTOFF):
+    """Return (HYRIV_ID, snap_distance_m) for the nearest reach within
+    radius_m, or (None, None) if nothing is found within that radius.
+    Uses the spatial index on the metric-CRS copy for fast candidate lookup,
+    then measures true planar distance in metres."""
+    point_wgs84 = gpd.GeoSeries([Point(lon, lat)], crs="EPSG:4326")
+    point_metric = point_wgs84.to_crs(rivers_metric.crs).iloc[0]
 
+    search_area = point_metric.buffer(radius_m)
+    candidate_positions = list(
+        rivers_metric.sindex.query(search_area, predicate="intersects")
+    )
 
-def approx_distance_m(candidates: gpd.GeoDataFrame, lon: float, lat: float):
-    """Approximate planar distance in metres from (lon, lat) to each geometry,
-    using an equirectangular approximation centred on the dam's latitude
-    (scale longitude by cos(lat)). Accurate to well under 1% at the few-km
-    scale used here, and avoids a per-dam UTM zone lookup/reprojection."""
-    scale_x = math.cos(math.radians(lat))
-    scaled_geoms = candidates.geometry.affine_transform([scale_x, 0, 0, 1, 0, 0])
-    point_scaled = Point(lon * scale_x, lat)
-    return scaled_geoms.distance(point_scaled) * METERS_PER_DEGREE
+    if not candidate_positions:
+        return None, None
 
+    candidates = rivers_metric.iloc[candidate_positions]
+    distances = candidates.geometry.distance(point_metric)
+    best_pos_in_candidates = distances.values.argmin()
+    best_position = candidate_positions[best_pos_in_candidates]
 
-def snap_to_nearest_reach(shp_path: Path, lon: float, lat: float):
-    """Return (HYRIV_ID, snap_distance_m) for the nearest reach, or (None, None)
-    if nothing is found within HARD_SNAP_CUTOFF."""
-    old_cwd = os.getcwd()
-    for radius_deg in (0.02, 0.05, 0.1):  # progressively wider bbox (~2 / 5 / 10 km)
-        bbox = (lon - radius_deg, lat - radius_deg, lon + radius_deg, lat + radius_deg)
-        try:
-            os.chdir(shp_path.parent)
-            candidates = gpd.read_file(shp_path.name, bbox=bbox)
-        finally:
-            os.chdir(old_cwd)
+    nearest_reach = rivers.iloc[best_position]
+    snap_distance_m = distances.iloc[best_pos_in_candidates]
 
-        if candidates.empty:
-            continue
+    if snap_distance_m > radius_m:
+        return None, None
 
-        candidates["_dist_m"] = approx_distance_m(candidates, lon, lat)
-        nearest = candidates.loc[candidates["_dist_m"].idxmin()]
-
-        if nearest["_dist_m"] <= HARD_SNAP_CUTOFF:
-            return int(nearest["HYRIV_ID"]), float(nearest["_dist_m"])
-
-    return None, None
+    return int(nearest_reach["HYRIV_ID"]), float(snap_distance_m)
 
 
 # ---------------------------------------------------------------------------
@@ -160,15 +176,10 @@ def collect_upstream_ids(reverse_graph: dict, start_id: int) -> list:
     return list(visited)
 
 
-def export_upstream_gpkg(shp_path: Path, upstream_ids: list, out_path: Path):
-    id_list = ",".join(str(i) for i in upstream_ids)
-    where_clause = f"HYRIV_ID IN ({id_list})"
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(shp_path.parent)
-        gdf = gpd.read_file(shp_path.name, where=where_clause)
-    finally:
-        os.chdir(old_cwd)
+def export_upstream_gpkg(rivers: gpd.GeoDataFrame, upstream_ids: list, out_path: Path):
+    """Filter the already-loaded river GeoDataFrame in-memory and write the
+    subset to a GeoPackage. No per-dam disk re-read, no GDAL "where" clause."""
+    gdf = rivers[rivers["HYRIV_ID"].isin(upstream_ids)].copy()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_file(out_path, driver="GPKG")
     return gdf
@@ -194,9 +205,11 @@ def main():
 
     shp_path = find_hydrorivers_shp()
     print(f"Using HydroRIVERS file: {shp_path}")
-    print("Building upstream connectivity graph (one-time, whole network)...")
-    reverse_graph = build_reverse_graph(shp_path)
-    print(f"Graph built: {len(reverse_graph):,} downstream nodes with upstream contributors.")
+    print("Loading river network and building upstream connectivity graph "
+          "(one-time, whole network)...")
+    rivers, rivers_metric, reverse_graph = load_river_network(shp_path)
+    print(f"Loaded {len(rivers):,} reaches; "
+          f"{len(reverse_graph):,} downstream nodes with upstream contributors.")
 
     out_subdir = PLOT_DIR / csv_stem
     output_csv_path = OUTPUT_DIR / f"{csv_stem}_output.csv"
@@ -209,20 +222,20 @@ def main():
 
         lat, lon = row["Latitude"], row["Longitude"]
         try:
-            snapped_id, snap_dist = snap_to_nearest_reach(shp_path, lon, lat)
+            snapped_id, snap_dist = snap_to_nearest_reach(rivers, rivers_metric, lon, lat)
             if snapped_id is None:
                 df.at[i, "QC_flag"] = "NO_SNAP"
                 continue
 
             upstream_ids = collect_upstream_ids(reverse_graph, snapped_id)
             out_gpkg = out_subdir / f"{dam_id}_DrainageSystem.gpkg"
-            export_upstream_gpkg(shp_path, upstream_ids, out_gpkg)
+            export_upstream_gpkg(rivers, upstream_ids, out_gpkg)
 
             df.at[i, "QC_flag"] = "OK"
             df.at[i, "Snap_distance_m"] = round(snap_dist, 1)
             df.at[i, "N_upstream_reaches"] = len(upstream_ids)
 
-            flag = "" if snap_dist <= DEFAULT_SNAP_RADIUS else "  <-- large snap distance, verify in QGIS"
+            flag = "" if snap_dist <= DEFAULT_SNAP_RADIUS else " <-- large snap distance, verify in QGIS"
             print(f"Dam {dam_id}: snapped {snap_dist:.0f} m, {len(upstream_ids)} reaches{flag}")
 
         except Exception as exc:
